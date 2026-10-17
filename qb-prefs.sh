@@ -30,18 +30,44 @@ if [ "$STATUS" != "200" ]; then
     read -rsp "WebUI Password: " QB_PASS
     echo ""
 
-    LOGIN_RES=$(curl -sS -c "$COOKIE" \
+    # Capture response body and HTTP status code together.
+    # Older qBittorrent (<5.2): 200 + body "Ok." on success, "Fails." on failure.
+    # qBittorrent 5.2+:        204 + empty body on success, 401 on failure.
+    LOGIN_OUT=$(curl -sS -c "$COOKIE" \
         --header "Referer: ${API}" \
         --data-urlencode "username=${QB_USER}" \
         --data-urlencode "password=${QB_PASS}" \
+        -w "\n%{http_code}" \
         "${API}/api/v2/auth/login")
 
-    if [ "$LOGIN_RES" != "Ok." ]; then
-        echo "[-] Login failed. Check credentials / port / scheme." >&2
+    HTTP_CODE=$(printf '%s\n' "$LOGIN_OUT" | tail -n1)
+    BODY=$(printf '%s\n' "$LOGIN_OUT" | sed '$d')
+
+    case "$HTTP_CODE" in
+        204) : ;;                                              # qBittorrent 5.2+
+        200) [ "$BODY" = "Ok." ] || { LOGIN_OK=0; } ; LOGIN_OK=${LOGIN_OK:-1} ;;
+        *)   LOGIN_OK=0 ;;
+    esac
+    : "${LOGIN_OK:=0}"
+
+    if [ "$LOGIN_OK" != "1" ]; then
+        echo "[-] Login failed (HTTP ${HTTP_CODE}, body: '${BODY}')." >&2
+        echo "    Check credentials. If they're correct, you may be IP-banned" >&2
+        echo "    from repeated failed attempts (restart qBittorrent or wait ~15 min)." >&2
         exit 1
     fi
 
-    curl -sS -b "$COOKIE" "${API}/api/v2/app/preferences" > "$PREFS_FILE"
+    # Retry the preferences fetch with the session cookie.
+    if ! STATUS=$(curl -sS -b "$COOKIE" -o "$PREFS_FILE" -w "%{http_code}" \
+            "${API}/api/v2/app/preferences"); then
+        echo "[-] Preferences fetch failed after login." >&2
+        exit 1
+    fi
+    if [ "$STATUS" != "200" ]; then
+        echo "[-] Preferences fetch still failed after login (HTTP ${STATUS})." >&2
+        echo "    If 403: CSRF/Host-header protection or IP ban may be active." >&2
+        exit 1
+    fi
 fi
 
 python3 - "$PREFS_FILE" <<'PY'
